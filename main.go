@@ -15,7 +15,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 
-	"github.com/astaxie/beego/logs"
+	"github.com/beego/beego/v2/core/logs"
 	"github.com/erikdubbelboer/gspt"
 	"github.com/internet-dev/db-export-tool/pkg/tools"
 )
@@ -264,65 +264,93 @@ func doWorkExportSchema(workArgs workArgsT, output *os.File) {
 func doWorkExportData(workArgs workArgsT, output *os.File) {
 	logs.Informational("[doWorkExportData] start work")
 
-	if workArgs.Chunk {
-		logs.Informational("[doWorkExportData] use chunk")
-		const chunkSize int64 = 1000
-
-		var total int64
-		totalSQL := fmt.Sprintf(`SELECT COUNT(*) AS total FROM %s`, workArgs.Table)
-		row := workArgs.DB.QueryRow(totalSQL)
-		err := row.Scan(&total)
+	// 当 --table=all 时，先查询所有表名，否则直接解析参数中的表名列表
+	var tables []string
+	if workArgs.Table == "all" {
+		querySQL := "SHOW TABLES"
+		logs.Debug("[doWorkExportData] sql: %s", querySQL)
+		rows, err := workArgs.DB.Query(querySQL)
 		if err != nil {
 			panic(err)
 		}
+		defer rows.Close()
 
-		var pageTotal int64 = int64(math.Ceil(float64(total) / float64(chunkSize)))
-		logs.Debug("[doWorkExportData] pageTotal: %d", pageTotal)
-
-		for i := int64(0); i < pageTotal; i++ {
-			offset := i * chunkSize
-			querSQL := fmt.Sprintf(`SELECT * FROM %s LIMIT %d OFFSET %d`, workArgs.Table, chunkSize, offset)
-			logs.Debug("[doWorkExportData] sql: %s", querSQL)
-			output.WriteString(fmt.Sprintf("/** chunk: %d */\n", i))
-			doWorkExportDataUseChunk(workArgs, output, querSQL)
+		for rows.Next() {
+			var tableName string
+			if err := rows.Scan(&tableName); err != nil {
+				panic(err)
+			}
+			tables = append(tables, tableName)
 		}
 	} else {
-		sqlBytes, err := ioutil.ReadFile(workArgs.Input)
-		if err != nil {
-			fmt.Fprintf(os.Stdout, "cat not read sql file:%s, err: %s\n", workArgs.Input, err.Error())
-			os.Exit(30)
-		}
+		tables = strings.Split(workArgs.Table, ",")
+	}
 
-		querySQL := string(sqlBytes)
-		doWorkExportDataUseChunk(workArgs, output, querySQL)
+	// 对每个表分别导出数据
+	for _, table := range tables {
+		output.WriteString(fmt.Sprintf("/* export table: %s */\n", table))
+		if workArgs.Chunk {
+			const chunkSize int64 = 1000
+
+			// 获取该表总行数
+			totalSQL := fmt.Sprintf("SELECT COUNT(*) AS total FROM %s", table)
+			logs.Debug("[doWorkExportData] sql: %s", totalSQL)
+			row := workArgs.DB.QueryRow(totalSQL)
+			var total int64
+			if err := row.Scan(&total); err != nil {
+				panic(err)
+			}
+
+			pageTotal := int64(math.Ceil(float64(total) / float64(chunkSize)))
+			logs.Debug("[doWorkExportData] table %s total rows: %d, pages: %d", table, total, pageTotal)
+
+			for i := int64(0); i < pageTotal; i++ {
+				offset := i * chunkSize
+				querySQL := fmt.Sprintf("SELECT * FROM %s LIMIT %d OFFSET %d", table, chunkSize, offset)
+				logs.Debug("[doWorkExportData] sql: %s", querySQL)
+				output.WriteString(fmt.Sprintf("/** chunk: %d **/\n", i))
+				doWorkExportDataUseChunk(workArgs, output, querySQL, table)
+			}
+		} else {
+			// 读取SQL文件（假设SQL文件中包含正确的查询语句，不需要再替换表名）
+			sqlBytes, err := ioutil.ReadFile(workArgs.Input)
+			if err != nil {
+				fmt.Fprintf(os.Stdout, "cannot read sql file:%s, err: %s\n", workArgs.Input, err.Error())
+				os.Exit(30)
+			}
+			querySQL := string(sqlBytes)
+			doWorkExportDataUseChunk(workArgs, output, querySQL, table)
+		}
 	}
 
 	logs.Informational("[doWorkExportData] jobs have done.")
 }
 
-func doWorkExportDataUseChunk(workArgs workArgsT, output *os.File, querySQL string) {
+func doWorkExportDataUseChunk(workArgs workArgsT, output *os.File, querySQL string, table string) {
 	logs.Informational("[doWorkExportDataUseChunk] chunk jobs start.")
-	logs.Debug("sql:", querySQL)
+	logs.Debug("sql: %s", querySQL)
 
 	rows, err := workArgs.DB.Query(querySQL)
 	if err != nil {
 		panic(err)
 	}
+	defer rows.Close()
 
 	var fieldBox []string
-	var skipFieldBox = make(map[string]bool)
+	skipFieldBox := make(map[string]bool)
 	expSkipField := strings.Split(workArgs.SkipField, ",")
-	if len(expSkipField) > 0 {
-		for _, field := range expSkipField {
+	for _, field := range expSkipField {
+		if field != "" {
 			skipFieldBox[field] = true
 		}
 	}
 
 	var columns []string
 	var colsNum int
-	var i int
+	rowIndex := 0
 	for rows.Next() {
-		if i == 0 {
+		// 首次循环获取字段信息并写入 INSERT 语句
+		if rowIndex == 0 {
 			columns, _ = rows.Columns()
 			for _, col := range columns {
 				if skipFieldBox[col] {
@@ -331,40 +359,38 @@ func doWorkExportDataUseChunk(workArgs workArgsT, output *os.File, querySQL stri
 				fieldBox = append(fieldBox, col)
 			}
 			colsNum = len(columns)
-
-			initSql := fmt.Sprintf("INSERT INTO %s (%s) VALUES\n", workArgs.Table, strings.Join(fieldBox, ", "))
+			initSql := fmt.Sprintf("INSERT INTO %s (%s) VALUES\n", table, strings.Join(fieldBox, ", "))
 			output.WriteString(initSql)
 		} else {
 			output.WriteString(",\n")
 		}
 
-		//fmt.Println("fieldBox:", fieldBox)
-		//fmt.Println("skipFieldBox:", skipFieldBox)
-
-		var values []string
+		// 读取一行数据
+		values := make([]string, 0, colsNum)
 		refs := make([]interface{}, colsNum)
 		for i := range refs {
 			var ref interface{}
 			refs[i] = &ref
 		}
-		rows.Scan(refs...)
+		if err := rows.Scan(refs...); err != nil {
+			panic(err)
+		}
 
+		// 处理每个字段，跳过不需要的字段
 		for k, col := range columns {
 			if skipFieldBox[col] {
 				continue
 			}
 			val := reflect.Indirect(reflect.ValueOf(refs[k])).Interface()
-			ve := fmt.Sprintf(`%s`, val)
-			values = append(values, fmt.Sprintf(`'%s'`, workArgs.EscapeFunc(ve)))
+			ve := fmt.Sprintf("%v", val)
+			// 对字段值做转义处理
+			values = append(values, fmt.Sprintf("'%s'", workArgs.EscapeFunc(ve)))
 		}
 		vSql := fmt.Sprintf("(%s)", strings.Join(values, ", "))
-
 		output.WriteString(vSql)
-		i++
-
+		rowIndex++
 	}
 
 	output.WriteString(";\n\n")
-
 	logs.Informational("[doWorkExportDataUseChunk] chunk jobs have done.")
 }
