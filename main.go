@@ -382,9 +382,15 @@ func doWorkExportDataUseChunk(workArgs workArgsT, output *os.File, querySQL stri
 				continue
 			}
 			val := reflect.Indirect(reflect.ValueOf(refs[k])).Interface()
-			ve := fmt.Sprintf("%v", val)
-			// 对字段值做转义处理
-			values = append(values, fmt.Sprintf("'%s'", workArgs.EscapeFunc(ve)))
+			var ve string
+			// 如果是 []byte 类型，则转换为字符串
+			if b, ok := val.([]byte); ok {
+				ve = string(b)
+			} else {
+				ve = fmt.Sprintf("%v", val)
+			}
+			escapedVal := workArgs.EscapeFunc(ve)
+			values = append(values, fmt.Sprintf("'%s'", escapedVal))
 		}
 		vSql := fmt.Sprintf("(%s)", strings.Join(values, ", "))
 		output.WriteString(vSql)
